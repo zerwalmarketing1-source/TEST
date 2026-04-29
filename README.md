@@ -1,3 +1,3 @@
 # STOURS DMC Hotel Catalogue
 
-Base branch for review.
+Static premium hotel catalogue generated from the provided Excel and STOURS DMC brand assets.
