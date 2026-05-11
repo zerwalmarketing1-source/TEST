@@ -11,7 +11,6 @@ Then open http://127.0.0.1:8000/admin
 from __future__ import annotations
 
 import argparse
-import html
 import json
 import mimetypes
 import re
@@ -21,7 +20,7 @@ import unicodedata
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import quote_plus, unquote, urlparse
 
 import requests
 from bs4 import BeautifulSoup, Tag
@@ -96,9 +95,9 @@ def card_to_dict(card: Tag, index: int) -> dict[str, object]:
         title.get_text(strip=True): text_or_empty(title.find_next_sibling(class_="data-text"))
         for title in card.select(".data-title")
     }
-    info = {
-        text_or_empty(info_box.select_one("small")): text_or_empty(info_box.select_one("span"))
-        for info_box in card.select(".info")
+    details = {
+        text_or_empty(detail.select_one("small")): text_or_empty(detail.select_one("span"))
+        for detail in card.select(".travel-detail")
     }
     badges = [text_or_empty(pill) for pill in card.select(".pill")]
     return {
@@ -107,11 +106,10 @@ def card_to_dict(card: Tag, index: int) -> dict[str, object]:
         "name": text_or_empty(card.select_one("h3")),
         "stars": text_or_empty(card.select_one(".stars")),
         "badges": badges,
-        "classification": info.get("CLASSIFICATION", badges[0] if badges else ""),
-        "destination": info.get("DESTINATION", city["name"]),
-        "access": info.get("ACCESS", ""),
-        "visuals": info.get("VISUALS", ""),
-        "photo_note": text_or_empty(card.select_one(".photo-note")),
+        "classification": badges[0] if badges else "",
+        "location": details.get("Localisation Google Maps", city["name"]),
+        "airport_route": details.get("Trajet hôtel ↔ aéroport", ""),
+        "room_names": details.get("Chambres", data.get("ROOMS", "")),
         "official_url": card.select_one(".hotel-link").get("href", "") if card.select_one(".hotel-link") else "",
         "sections": {label: data.get(label, "") for label in SECTION_LABELS},
         "images": card_images(card),
@@ -127,6 +125,90 @@ def set_text(node: Tag | None, value: str) -> None:
     if node is not None:
         node.clear()
         node.append(value)
+
+
+def google_maps_search(name: str, destination: str) -> str:
+    query = f"{name} {destination} Morocco hotel".strip()
+    return "https://www.google.com/maps/search/?api=1&query=" + quote_plus(query)
+
+
+def google_maps_directions(name: str, destination: str) -> str:
+    origin = f"{name} {destination} Morocco".strip()
+    airport = f"{destination} airport Morocco".strip()
+    return (
+        "https://www.google.com/maps/dir/?api=1&origin="
+        + quote_plus(origin)
+        + "&destination="
+        + quote_plus(airport)
+        + "&travelmode=driving"
+    )
+
+
+def ensure_travel_details(card: Tag, soup: BeautifulSoup) -> Tag:
+    details = card.select_one(".travel-details")
+    if details:
+        return details
+    body = card.select_one(".hotel-body")
+    if body is None:
+        raise ValueError("Hotel card has no body")
+    details = soup.new_tag("div")
+    details["class"] = "travel-details"
+    name = text_or_empty(card.select_one("h3"))
+    city = parent_city(card)["name"]
+    rooms = ""
+    for data_section in card.select(".data-section"):
+        if text_or_empty(data_section.select_one(".data-title")) == "ROOMS":
+            rooms = text_or_empty(data_section.select_one(".data-text"))
+    for label, value, href, cta in [
+        ("Localisation Google Maps", city, google_maps_search(name, city), "Voir la carte"),
+        ("Trajet hôtel ↔ aéroport", "Trajet à vérifier sur Google Maps", google_maps_directions(name, city), "Ouvrir le trajet"),
+        ("Chambres", rooms or "Noms/types de chambres à compléter depuis la source officielle", None, None),
+    ]:
+        item = soup.new_tag("div")
+        item["class"] = "travel-detail"
+        small = soup.new_tag("small")
+        small.append(label)
+        span = soup.new_tag("span")
+        span.append(value)
+        item.append(small)
+        item.append(span)
+        if href:
+            link = soup.new_tag("a", href=href, target="_blank", rel="noopener")
+            link.append(cta or "Ouvrir")
+            item.append(link)
+        details.append(item)
+    thumbs = card.select_one(".thumbs")
+    if thumbs:
+        thumbs.insert_before(details)
+    else:
+        body.append(details)
+    return details
+
+
+def set_travel_detail(card: Tag, soup: BeautifulSoup, label: str, value: str, href: str | None = None) -> None:
+    details = ensure_travel_details(card, soup)
+    item = None
+    for candidate in details.select(".travel-detail"):
+        if text_or_empty(candidate.select_one("small")) == label:
+            item = candidate
+            break
+    if item is None:
+        item = soup.new_tag("div")
+        item["class"] = "travel-detail"
+        small = soup.new_tag("small")
+        small.append(label)
+        span = soup.new_tag("span")
+        item.append(small)
+        item.append(span)
+        details.append(item)
+    set_text(item.select_one("span"), value)
+    if href:
+        link = item.select_one("a")
+        if link is None:
+            link = soup.new_tag("a", target="_blank", rel="noopener")
+            link.append("Ouvrir")
+            item.append(link)
+        link["href"] = href
 
 
 def find_card(soup: BeautifulSoup, index: int) -> Tag:
@@ -187,24 +269,24 @@ def update_hotel(catalogue_path: Path, index: int, payload: dict[str, object]) -
             if label in sections:
                 set_text(data_section.select_one(".data-text"), str(sections[label]))
 
-    simple_fields = {
-        "classification": "CLASSIFICATION",
-        "destination": "DESTINATION",
-        "access": "ACCESS",
-        "visuals": "VISUALS",
-    }
-    for payload_key, label in simple_fields.items():
-        if payload_key in payload:
-            for info_box in card.select(".info"):
-                if text_or_empty(info_box.select_one("small")) == label:
-                    set_text(info_box.select_one("span"), str(payload[payload_key]))
-            if payload_key == "classification":
-                first_pill = card.select_one(".pill")
-                if first_pill:
-                    set_text(first_pill, str(payload[payload_key]))
-
-    if "photo_note" in payload:
-        set_text(card.select_one(".photo-note"), str(payload["photo_note"]))
+    if "classification" in payload:
+        first_pill = card.select_one(".pill")
+        if first_pill:
+            set_text(first_pill, str(payload["classification"]))
+    hotel_name = text_or_empty(card.select_one("h3"))
+    destination = str(payload.get("location", parent_city(card)["name"]))
+    if "location" in payload:
+        set_travel_detail(card, soup, "Localisation Google Maps", destination, google_maps_search(hotel_name, destination))
+    if "airport_route" in payload:
+        set_travel_detail(
+            card,
+            soup,
+            "Trajet hôtel ↔ aéroport",
+            str(payload["airport_route"]),
+            google_maps_directions(hotel_name, destination),
+        )
+    if "room_names" in payload:
+        set_travel_detail(card, soup, "Chambres", str(payload["room_names"]))
     if "official_url" in payload:
         link = card.select_one(".hotel-link")
         if link:
@@ -347,23 +429,25 @@ def clone_card_template(soup: BeautifulSoup, row: dict[str, str]) -> Tag:
         else:
             value = "Accès à confirmer auprès de l’hôtel"
         set_text(data_section.select_one(".data-text"), value)
-    for info_box in card.select(".info"):
-        label = text_or_empty(info_box.select_one("small"))
-        if label == "CLASSIFICATION":
-            set_text(info_box.select_one("span"), classification)
-        elif label == "DESTINATION":
-            set_text(info_box.select_one("span"), city)
-        elif label == "ACCESS":
-            set_text(info_box.select_one("span"), "Accès à confirmer auprès de l’hôtel")
-        elif label == "VISUALS":
-            set_text(info_box.select_one("span"), "0 validée(s)")
-    set_text(card.select_one(".photo-note"), "Photos à ajouter")
+    for node in card.select(".info-grid, .photo-note, .travel-details"):
+        node.decompose()
+    set_travel_detail(card, soup, "Localisation Google Maps", city, google_maps_search(name, city))
+    set_travel_detail(
+        card,
+        soup,
+        "Trajet hôtel ↔ aéroport",
+        "Trajet à vérifier sur Google Maps",
+        google_maps_directions(name, city),
+    )
+    set_travel_detail(card, soup, "Chambres", f"Noms/types de chambres à compléter pour {name}.")
     thumbs = card.select_one(".thumbs")
     if thumbs:
         thumbs.clear()
     link = card.select_one(".hotel-link")
     if link:
         link["href"] = row.get("official_url", "")
+    for source in card.select(".source"):
+        source.decompose()
     return card
 
 
@@ -389,9 +473,9 @@ def apply_excel_import(catalogue_path: Path, excel_path: Path) -> dict[str, obje
         name_key = normalize(text_or_empty(card.select_one("h3")))
         by_name.setdefault(name_key, []).append(card)
         city_values = {normalize(parent_city(card)["name"])}
-        for info_box in card.select(".info"):
-            if text_or_empty(info_box.select_one("small")) == "DESTINATION":
-                city_values.add(normalize(text_or_empty(info_box.select_one("span"))))
+        location = card_to_dict(card, 0).get("location")
+        if location:
+            city_values.add(normalize(str(location)))
         for city_value in city_values:
             by_city_name[(city_value, name_key)] = card
     sections = {normalize(text_or_empty(section.select_one(".city-title, h2"))): section for section in soup.select("section.section")}
@@ -423,13 +507,15 @@ def apply_excel_import(catalogue_path: Path, excel_path: Path) -> dict[str, obje
             first_pill = card.select_one(".pill")
             if first_pill:
                 set_text(first_pill, row["classification"])
-            for info_box in card.select(".info"):
-                if text_or_empty(info_box.select_one("small")) == "CLASSIFICATION":
-                    set_text(info_box.select_one("span"), row["classification"])
         if row.get("city"):
-            for info_box in card.select(".info"):
-                if text_or_empty(info_box.select_one("small")) == "DESTINATION":
-                    set_text(info_box.select_one("span"), row["city"].strip())
+            set_travel_detail(card, soup, "Localisation Google Maps", row["city"].strip(), google_maps_search(row["name"], row["city"]))
+            set_travel_detail(
+                card,
+                soup,
+                "Trajet hôtel ↔ aéroport",
+                "Trajet à vérifier sur Google Maps",
+                google_maps_directions(row["name"], row["city"]),
+            )
         if row.get("official_url"):
             link = card.select_one(".hotel-link")
             if link:
@@ -514,7 +600,7 @@ async function loadHotels(){
 function renderList(){
   const q = $('search').value.toLowerCase();
   $('list').innerHTML = hotels.filter(h => !q || h.name.toLowerCase().includes(q) || h.city.name.toLowerCase().includes(q)).map(h =>
-    `<div class="hotel ${current && current.index===h.index?'active':''}" onclick="edit(${h.index})"><b>${h.name}</b><span>${h.city.name} · ${h.classification}</span></div>`
+    `<div class="hotel ${current && current.index===h.index?'active':''}" onclick="edit(${h.index})"><b>${h.name}</b><span>${h.city.name}</span></div>`
   ).join('');
 }
 function edit(index){
@@ -525,13 +611,12 @@ function edit(index){
     <div class="grid">
       <div><label>Nom hôtel</label><input id="name" value="${escapeHtml(current.name)}"></div>
       <div><label>Classification</label><input id="classification" value="${escapeHtml(current.classification)}"></div>
-      <div><label>Destination</label><input id="destination" value="${escapeHtml(current.destination)}"></div>
-      <div><label>Accès</label><input id="access" value="${escapeHtml(current.access)}"></div>
-      <div><label>Visuels</label><input id="visuals" value="${escapeHtml(current.visuals)}"></div>
+      <div><label>Localisation Google Maps</label><input id="location" value="${escapeHtml(current.location)}"></div>
+      <div><label>Trajet hôtel ↔ aéroport</label><input id="airport_route" value="${escapeHtml(current.airport_route)}"></div>
+      <div><label>Noms/types de chambres</label><input id="room_names" value="${escapeHtml(current.room_names)}"></div>
       <div><label>Site officiel</label><input id="official_url" value="${escapeHtml(current.official_url)}"></div>
     </div>
     ${labels.map(label => `<label>${label}</label><textarea id="section-${label}">${escapeHtml(s[label] || '')}</textarea>`).join('')}
-    <label>Note photo</label><input id="photo_note" value="${escapeHtml(current.photo_note)}">
     <label>Photos locales (slot 1 = photo principale)</label>
     <div class="images">${current.images.map((src,i)=>imageCard(src,i)).join('')}${imageCard('', current.images.length)}</div>
     <p><button onclick="saveHotel()">Enregistrer contenu/photos</button></p>
@@ -551,8 +636,8 @@ async function saveHotel(){
   const images = [];
   for(let i=0;i<12;i++){ const el = $('image-'+i); if(el && el.value.trim()) images.push(el.value.trim()); }
   const payload = {
-    name:$('name').value, classification:$('classification').value, destination:$('destination').value, access:$('access').value,
-    visuals:$('visuals').value, official_url:$('official_url').value, photo_note:$('photo_note').value, images,
+    name:$('name').value, classification:$('classification').value, location:$('location').value,
+    airport_route:$('airport_route').value, room_names:$('room_names').value, official_url:$('official_url').value, images,
     sections:Object.fromEntries(labels.map(label => [label, $('section-'+label).value]))
   };
   const data = await api(`/api/hotels/${current.index}`, {method:'POST', body:JSON.stringify(payload)});
