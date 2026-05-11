@@ -410,14 +410,8 @@ def clone_card_template(soup: BeautifulSoup, row: dict[str, str]) -> Tag:
     if hero:
         hero["src"] = "assets/logos/stours-dmc-preferred.png"
         hero["alt"] = name
-    for pill in card.select(".pill"):
-        pill.decompose()
-    badge_row = card.select_one(".badge-row")
-    if badge_row:
-        pill = soup.new_tag("span")
-        pill["class"] = "pill"
-        pill.append(classification)
-        badge_row.append(pill)
+    for node in card.select(".pill, .badge-row, .stars"):
+        node.decompose()
     for data_section in card.select(".data-section"):
         label = text_or_empty(data_section.select_one(".data-title"))
         if label == "ROOMS":
@@ -427,7 +421,7 @@ def clone_card_template(soup: BeautifulSoup, row: dict[str, str]) -> Tag:
         elif label == "SIGNATURE EXPERIENCE":
             value = f"Expérience signature à compléter pour {name}."
         else:
-            value = "Accès à confirmer auprès de l’hôtel"
+            value = "Localisation et trajet consultables via Google Maps."
         set_text(data_section.select_one(".data-text"), value)
     for node in card.select(".info-grid, .photo-note, .travel-details"):
         node.decompose()
@@ -503,10 +497,6 @@ def apply_excel_import(catalogue_path: Path, excel_path: Path) -> dict[str, obje
         else:
             updated += 1
         set_text(card.select_one("h3"), row["name"])
-        if row.get("classification"):
-            first_pill = card.select_one(".pill")
-            if first_pill:
-                set_text(first_pill, row["classification"])
         if row.get("city"):
             set_travel_detail(card, soup, "Localisation Google Maps", row["city"].strip(), google_maps_search(row["name"], row["city"]))
             set_travel_detail(
